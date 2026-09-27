@@ -1,0 +1,16 @@
+# Generated speech/audio output
+*.wav
+*.au
+*.raw
+*.pcm
+*.mp3
+*.ogg
+*.flac
+*.aac
+*.m4a
+
+# Local build output
+dectalk-tune
+
+# Local editor/OS clutter
+.DS_Store

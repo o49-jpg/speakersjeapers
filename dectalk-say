@@ -1,0 +1,452 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# Friendly wrapper around the bundled DECtalk `say` binary.
+# It loads tweakable defaults from dectalk-settings.conf, maps voice names
+# to DECtalk speaker numbers, and can optionally route through `dectalk-tune`
+# for deep SPDEFS voice-parameter experiments.
+
+SCRIPT_SOURCE=${BASH_SOURCE[0]}
+while [ -L "$SCRIPT_SOURCE" ]; do
+  SCRIPT_DIR=$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)
+  SCRIPT_SOURCE=$(readlink "$SCRIPT_SOURCE")
+  [[ $SCRIPT_SOURCE != /* ]] && SCRIPT_SOURCE=$SCRIPT_DIR/$SCRIPT_SOURCE
+done
+ROOT_DIR=$(cd -P "$(dirname "$SCRIPT_SOURCE")" >/dev/null 2>&1 && pwd)
+ORIG_PWD=$PWD
+SAY_BIN=$ROOT_DIR/say
+TUNE_BIN=$ROOT_DIR/dectalk-tune
+
+# Defaults. Override these in ./dectalk-settings.conf or in the environment.
+# Leave DECTALK_LANG blank to use DECtalk.conf's Default_lang.
+DECTALK_LANG=${DECTALK_LANG:-}
+DECTALK_VOICE=${DECTALK_VOICE:-paul}
+DECTALK_RATE=${DECTALK_RATE:-180}
+DECTALK_VOLUME=${DECTALK_VOLUME:-90}
+DECTALK_ENCODING=${DECTALK_ENCODING:-1}
+DECTALK_PRE=${DECTALK_PRE:-}
+DECTALK_POST=${DECTALK_POST:-}
+DECTALK_OUT=${DECTALK_OUT:-}
+DECTALK_CLAUSE=${DECTALK_CLAUSE:-0}
+
+# Deep tuning defaults. These are only used by ./dectalk-tune.
+# Examples:
+#   DECTALK_PRESET="robot"
+#   DECTALK_PARAMS="pitch=95 head=140 roughness=70"
+DECTALK_PRESET=${DECTALK_PRESET:-}
+DECTALK_PARAMS=${DECTALK_PARAMS:-}
+DECTALK_USE_TUNE=${DECTALK_USE_TUNE:-auto}
+
+SETTINGS_FILE=${DECTALK_SETTINGS:-$ROOT_DIR/dectalk-settings.conf}
+if [[ -f $SETTINGS_FILE ]]; then
+  # shellcheck disable=SC1090
+  source "$SETTINGS_FILE"
+fi
+
+err() {
+  printf 'dectalk-say: %s\n' "$*" >&2
+}
+
+print_help() {
+  cat <<'EOF'
+Usage:
+  ./dectalk-say [options] "text to speak"
+  echo "text to speak" | ./dectalk-say [options]
+  ./dectalk-say --file input.txt [options]
+
+Common options:
+  --voice, -s NAME|N    Speaker voice. Names and numbers are listed below.
+  --rate, -r N          Speaking rate. DECtalk breaks above 600, so this wrapper clamps there.
+  --volume, -v N        Volume, 0-100. Default: config.
+  --lang, -l CODE       Language: us, uk, sp, gr/de, la, fr. Blank uses DECtalk.conf.
+  --pre TEXT            DECtalk command text sent before normal input.
+  --post TEXT           DECtalk command text sent after normal input.
+  --out, -o FILE        Write audio to FILE instead of the audio device.
+  --encoding, -e N      Output encoding for --out: 1=16-bit PCM, 2=8-bit PCM, 3=mulaw.
+  --file, -f FILE       Speak text from FILE.
+  --clause, -c          Use DECtalk clause mode for stdin/file input with the classic say engine.
+
+Deep voice-shaping options, routed through ./dectalk-tune:
+  --preset NAME         Apply a built-in SPDEFS preset: robot, giant, chipmunk,
+                        whisper, rough, flat, bright, dark.
+  --param NAME=VALUE    Set a raw voice parameter. Repeatable.
+                        Examples: pitch=95 head=140 breath=70 roughness=85.
+                        Also supports NAME+=N and NAME-=N.
+  --dump-params         Print current/default/low/high SPDEFS values, then speak.
+  --dump-only           Print SPDEFS values and exit without speaking.
+  --list-presets        Print deep-tuning presets.
+  --list-params         Print deep-tuning parameter names and aliases.
+  --tune                Force the deep-tuning engine even without presets/params.
+
+Other:
+  --list-voices         Print speaker aliases.
+  --raw ARGS...         Bypass this wrapper and pass ARGS directly to ./say.
+  --help, -h            Show this help.
+
+Voice aliases:
+  0 paul/pablo
+  1 betty/berta/beate
+  2 harry/humberto/hans
+  3 frank/francisco
+  4 dennis/domingo/dieter
+  5 kit/kid/juanito/karl
+  6 ursula
+  7 rita
+  8 wendy
+
+Examples:
+  ./dectalk-say --voice betty --rate 600 "Fast, but still inside DECtalk's limit."
+  ./dectalk-say --preset giant --param roughness=60 "A very different voice."
+  ./dectalk-say --preset robot --out robot.wav "Greetings, human."
+  ./dectalk-say --param pitch=260 --param head=55 "Chipmunk without using a preset."
+
+Defaults live in ./dectalk-settings.conf. Edit that file for your usual voice,
+rate, volume, language, preset, and raw parameter tweaks.
+EOF
+}
+
+list_voices() {
+  cat <<'EOF'
+0  paul, pablo
+1  betty, berta, beate
+2  harry, humberto, hans
+3  frank, francisco
+4  dennis, domingo, dieter
+5  kit, kid, juanito, karl
+6  ursula
+7  rita
+8  wendy
+EOF
+}
+
+need_value() {
+  local opt=$1
+  if [[ $# -lt 2 || ${2:-} == "" ]]; then
+    err "$opt needs a value"
+    exit 2
+  fi
+}
+
+is_uint() {
+  [[ ${1:-} =~ ^[0-9]+$ ]]
+}
+
+voice_to_id() {
+  local voice=${1,,}
+  case "$voice" in
+    0|paul|pablo) echo 0 ;;
+    1|betty|berta|beate) echo 1 ;;
+    2|harry|humberto|hans) echo 2 ;;
+    3|frank|francisco) echo 3 ;;
+    4|dennis|domingo|dieter) echo 4 ;;
+    5|kit|kid|juanito|karl) echo 5 ;;
+    6|ursula) echo 6 ;;
+    7|rita) echo 7 ;;
+    8|wendy) echo 8 ;;
+    9) echo 9 ;;
+    *)
+      err "unknown voice '$1'"
+      err "run './dectalk-say --list-voices' to see supported aliases"
+      exit 2
+      ;;
+  esac
+}
+
+abs_path() {
+  local path=$1
+  case "$path" in
+    ''|stdout:*|/*) printf '%s\n' "$path" ;;
+    *) printf '%s/%s\n' "$ORIG_PWD" "$path" ;;
+  esac
+}
+
+ensure_tune() {
+  if [[ -x $TUNE_BIN ]]; then
+    return 0
+  fi
+
+  if [[ -f $ROOT_DIR/Makefile && -f $ROOT_DIR/src/dectalk-tune.c ]]; then
+    err "building ./dectalk-tune for deep voice shaping..."
+    if make -s -C "$ROOT_DIR" dectalk-tune; then
+      return 0
+    fi
+  fi
+
+  err "deep voice shaping needs ./dectalk-tune"
+  err "try: make dectalk-tune"
+  exit 126
+}
+
+validate_settings() {
+  if [[ -n ${DECTALK_RATE:-} ]]; then
+    if ! is_uint "$DECTALK_RATE" || (( DECTALK_RATE < 75 )); then
+      err "rate must be a number of at least 75; got '$DECTALK_RATE'"
+      exit 2
+    fi
+    if (( DECTALK_RATE > 600 )); then
+      err "rate $DECTALK_RATE is above DECtalk's speaking limit; clamping to 600"
+      DECTALK_RATE=600
+    fi
+  fi
+
+  if [[ -n ${DECTALK_VOLUME:-} ]]; then
+    if ! is_uint "$DECTALK_VOLUME" || (( DECTALK_VOLUME > 100 )); then
+      err "volume must be a number from 0 to 100; got '$DECTALK_VOLUME'"
+      exit 2
+    fi
+  fi
+
+  if [[ -n ${DECTALK_ENCODING:-} ]]; then
+    if ! is_uint "$DECTALK_ENCODING" || (( DECTALK_ENCODING < 1 || DECTALK_ENCODING > 3 )); then
+      err "encoding must be 1, 2, or 3; got '$DECTALK_ENCODING'"
+      exit 2
+    fi
+  fi
+
+  case "${DECTALK_LANG:-}" in
+    ''|us|uk|sp|gr|de|la|fr) ;;
+    *)
+      err "language must be one of: us, uk, sp, gr/de, la, fr; got '$DECTALK_LANG'"
+      exit 2
+      ;;
+  esac
+}
+
+input_file=""
+text_parts=()
+presets=()
+params=()
+dump_params=0
+dump_only=0
+force_tune=0
+
+# Load deep tuning defaults from config/env. Commas and spaces both separate presets.
+if [[ -n ${DECTALK_PRESET:-} ]]; then
+  for preset in ${DECTALK_PRESET//,/ }; do
+    [[ -n $preset ]] && presets+=("$preset")
+  done
+fi
+if [[ -n ${DECTALK_PARAMS:-} ]]; then
+  # shellcheck disable=SC2206
+  config_params=( $DECTALK_PARAMS )
+  params+=("${config_params[@]}")
+fi
+case "${DECTALK_USE_TUNE,,}" in
+  1|yes|true|on|always) force_tune=1 ;;
+  auto|'') ;;
+  0|no|false|off|never) force_tune=0 ;;
+  *) err "DECTALK_USE_TUNE must be auto/always/never; got '$DECTALK_USE_TUNE'"; exit 2 ;;
+esac
+
+while (($#)); do
+  case "$1" in
+    --help|-h)
+      print_help
+      exit 0
+      ;;
+    --list-voices)
+      list_voices
+      exit 0
+      ;;
+    --list-presets)
+      ensure_tune
+      exec "$TUNE_BIN" --list-presets
+      ;;
+    --list-params)
+      ensure_tune
+      exec "$TUNE_BIN" --list-params
+      ;;
+    --voice|-s)
+      need_value "$1" "${2:-}"
+      DECTALK_VOICE=$2
+      shift 2
+      ;;
+    --rate|-r)
+      need_value "$1" "${2:-}"
+      DECTALK_RATE=$2
+      shift 2
+      ;;
+    --volume|-v)
+      need_value "$1" "${2:-}"
+      DECTALK_VOLUME=$2
+      shift 2
+      ;;
+    --lang|-l)
+      need_value "$1" "${2:-}"
+      DECTALK_LANG=$2
+      shift 2
+      ;;
+    --pre)
+      need_value "$1" "${2:-}"
+      DECTALK_PRE=$2
+      shift 2
+      ;;
+    --post)
+      need_value "$1" "${2:-}"
+      DECTALK_POST=$2
+      shift 2
+      ;;
+    --out|-o)
+      need_value "$1" "${2:-}"
+      DECTALK_OUT=$2
+      shift 2
+      ;;
+    --encoding|-e)
+      need_value "$1" "${2:-}"
+      DECTALK_ENCODING=$2
+      shift 2
+      ;;
+    --file|--fi|-f)
+      need_value "$1" "${2:-}"
+      input_file=$2
+      shift 2
+      ;;
+    --clause|-c)
+      DECTALK_CLAUSE=1
+      shift
+      ;;
+    --preset)
+      need_value "$1" "${2:-}"
+      presets+=("$2")
+      force_tune=1
+      shift 2
+      ;;
+    --param|-p)
+      need_value "$1" "${2:-}"
+      params+=("$2")
+      force_tune=1
+      shift 2
+      ;;
+    --dump-params)
+      dump_params=1
+      force_tune=1
+      shift
+      ;;
+    --dump-only)
+      dump_only=1
+      force_tune=1
+      shift
+      ;;
+    --tune)
+      force_tune=1
+      shift
+      ;;
+    --raw)
+      shift
+      export LD_LIBRARY_PATH="$ROOT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+      cd "$ROOT_DIR"
+      exec "$SAY_BIN" "$@"
+      ;;
+    --)
+      shift
+      text_parts+=("$@")
+      break
+      ;;
+    -*)
+      err "unknown option '$1'"
+      err "use --raw to pass native options directly to ./say"
+      exit 2
+      ;;
+    *)
+      text_parts+=("$1")
+      shift
+      ;;
+  esac
+done
+
+if [[ ! -x $SAY_BIN ]]; then
+  err "$SAY_BIN is not executable. Try: chmod +x say dectalk-say"
+  exit 126
+fi
+
+validate_settings
+
+use_tune=0
+if (( force_tune || ${#presets[@]} || ${#params[@]} || dump_params || dump_only )); then
+  use_tune=1
+fi
+
+export LD_LIBRARY_PATH="$ROOT_DIR/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+cd "$ROOT_DIR"
+
+if (( use_tune )); then
+  ensure_tune
+  cmd=("$TUNE_BIN")
+
+  if [[ -n ${DECTALK_LANG:-} ]]; then
+    cmd+=("--lang" "$DECTALK_LANG")
+  fi
+  if [[ -n ${DECTALK_VOICE:-} ]]; then
+    cmd+=("--voice" "$DECTALK_VOICE")
+  fi
+  if [[ -n ${DECTALK_RATE:-} ]]; then
+    cmd+=("--rate" "$DECTALK_RATE")
+  fi
+  if [[ -n ${DECTALK_VOLUME:-} ]]; then
+    cmd+=("--volume" "$DECTALK_VOLUME")
+  fi
+  if [[ -n ${DECTALK_PRE:-} ]]; then
+    cmd+=("--pre" "$DECTALK_PRE")
+  fi
+  if [[ -n ${DECTALK_POST:-} ]]; then
+    cmd+=("--post" "$DECTALK_POST")
+  fi
+  if [[ -n ${DECTALK_OUT:-} ]]; then
+    cmd+=("--out" "$(abs_path "$DECTALK_OUT")" "--encoding" "$DECTALK_ENCODING")
+  fi
+
+  for preset in "${presets[@]}"; do
+    cmd+=("--preset" "$preset")
+  done
+  for param in "${params[@]}"; do
+    cmd+=("--param" "$param")
+  done
+  (( dump_params )) && cmd+=("--dump-params")
+  (( dump_only )) && cmd+=("--dump-only")
+
+  if [[ -n $input_file ]]; then
+    if [[ ${DECTALK_CLAUSE:-0} == 1 ]]; then
+      err "--clause is only available with the classic say engine; deep tuning will speak the full input"
+    fi
+    cmd+=("--file" "$(abs_path "$input_file")")
+  elif ((${#text_parts[@]})); then
+    cmd+=("${text_parts[@]}")
+  fi
+else
+  cmd=("$SAY_BIN")
+
+  if [[ -n ${DECTALK_LANG:-} ]]; then
+    cmd+=("-l" "$DECTALK_LANG")
+  fi
+  if [[ -n ${DECTALK_VOICE:-} ]]; then
+    cmd+=("-s" "$(voice_to_id "$DECTALK_VOICE")")
+  fi
+  if [[ -n ${DECTALK_RATE:-} ]]; then
+    cmd+=("-r" "$DECTALK_RATE")
+  fi
+  if [[ -n ${DECTALK_VOLUME:-} ]]; then
+    cmd+=("-v" "$DECTALK_VOLUME")
+  fi
+  if [[ -n ${DECTALK_PRE:-} ]]; then
+    cmd+=("-pre" "$DECTALK_PRE")
+  fi
+  if [[ -n ${DECTALK_POST:-} ]]; then
+    cmd+=("-post" "$DECTALK_POST")
+  fi
+  if [[ -n ${DECTALK_OUT:-} ]]; then
+    cmd+=("-fo" "$(abs_path "$DECTALK_OUT")" "-e" "$DECTALK_ENCODING")
+  fi
+
+  if [[ -n $input_file ]]; then
+    [[ ${DECTALK_CLAUSE:-0} == 1 ]] && cmd+=("-c")
+    cmd+=("-fi" "$(abs_path "$input_file")")
+  elif ((${#text_parts[@]})); then
+    text=${text_parts[*]}
+    cmd+=("-a" "$text")
+  elif [[ ! -t 0 ]]; then
+    [[ ${DECTALK_CLAUSE:-0} == 1 ]] && cmd+=("-c")
+    cmd+=("-")
+  fi
+fi
+
+exec "${cmd[@]}"

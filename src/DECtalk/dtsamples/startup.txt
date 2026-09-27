@@ -1,0 +1,4 @@
+[:np]You have successfully installed DECtalk.
+The DECtalk voices are, Paul, [:nh]Harry, [:nd]Dennis, [:nf]Frank,
+[:nr]Rita, [:nb]Betty, [:nu]Ursula, [:nw]Wendy, [:nk] and me, Kit!
+[:ra 75][:nh]I can speak slowly [:ra 350]or I can speak rapidly.

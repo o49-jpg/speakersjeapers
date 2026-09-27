@@ -37,3 +37,85 @@ or the say from rsynth will be the one called when the program say is
 executed.
 
 
+
+
+Customizing DECtalk voice, rate, volume, and voice shape
+--------------------------------------------------------
+
+This repo includes a helper wrapper, `./dectalk-say`, so you can tweak the
+bundled `say` binary without remembering every DECtalk flag. It also has an
+optional deeper tuner, `./dectalk-tune`, which uses DECtalk's SPDEFS speaker
+parameter API for bigger voice changes.
+
+Build the tuner if it is not already present:
+
+    make dectalk-tune
+
+Edit `dectalk-settings.conf` for your normal defaults:
+
+    DECTALK_VOICE=paul
+    DECTALK_RATE=180
+    DECTALK_VOLUME=90
+    DECTALK_LANG=""          # blank uses DECtalk.conf Default_lang
+
+DECtalk's real speaking-rate limit is 600. Values above 600 can make the
+engine go silent, so the wrapper clamps anything higher to 600.
+
+Then speak text with those defaults:
+
+    ./dectalk-say "Hello from DECtalk."
+
+Override settings per run:
+
+    ./dectalk-say --voice betty --rate 210 "A faster Betty voice."
+    ./dectalk-say --voice kit --rate 260 --volume 80 "Tiny robot voice test."
+    ./dectalk-say --rate 999 "This is clamped to 600 instead of going silent."
+    ./dectalk-say --out demo.wav --encoding 1 "Save this as a wave file."
+
+Voice aliases accepted by the wrapper:
+
+    0 paul/pablo
+    1 betty/berta/beate
+    2 harry/humberto/hans
+    3 frank/francisco
+    4 dennis/domingo/dieter
+    5 kit/kid/juanito/karl
+    6 ursula
+    7 rita
+    8 wendy
+
+Deep voice-shaping examples:
+
+    ./dectalk-say --preset robot "Greetings, human."
+    ./dectalk-say --preset giant --param roughness=60 "Big rough voice."
+    ./dectalk-say --param pitch=260 --param head=55 "Tiny high voice."
+    ./dectalk-say --preset whisper --out whisper.wav "Breathy wave output."
+
+Built-in deep presets:
+
+    robot, giant, chipmunk, whisper, rough, flat, bright, dark
+
+List all raw SPDEFS parameters and aliases:
+
+    ./dectalk-say --list-params
+
+Print DECtalk's current/default/low/high parameter values for a voice:
+
+    ./dectalk-say --voice paul --dump-only
+
+You can also save deep defaults in `dectalk-settings.conf`:
+
+    DECTALK_PRESET="giant"
+    DECTALK_PARAMS="pitch=85 head=150 roughness=70"
+
+You can still send raw DECtalk commands before or after the text:
+
+    ./dectalk-say --pre "[:nb :ra220]" "Inline commands work too."
+
+Run `./dectalk-say --help` for all wrapper options, or use
+`./dectalk-say --raw ...` to pass arguments directly to the original `say`
+binary.
+
+If DECtalk prints `dlopen error:libpulse-simple.so.0`, install your distro's
+PulseAudio client library package, usually `libpulse0` on Debian/Ubuntu or
+`pulseaudio-libs` on Fedora/RHEL.
